@@ -18,8 +18,10 @@
 #     bash xray-mem-fix.sh apply 2     # 套用 balanced 档 (默认)
 #     bash xray-mem-fix.sh apply 4     # 套用 roomy 档 (单流最快, 最易 OOM)
 #     bash xray-mem-fix.sh protect     # 让 PID 1 不被 OOM 选中 (关键!)
+#     bash xray-mem-fix.sh cgroup      # 设 cgroup 软限 (sysctl 被锁时的替代)
 #     bash xray-mem-fix.sh swap        # 加 512M swap
 #     bash xray-mem-fix.sh advice      # 配置层面的减肥建议
+#     bash xray-mem-fix.sh watch       # 前台采样 sock/内存曲线 (只读)
 #     bash xray-mem-fix.sh revert      # 还原本脚本的全部改动
 # ============================================================================
 
@@ -27,7 +29,8 @@ set -uo pipefail
 
 STATE_DIR="/etc/xray-mem-fix"
 CREATED_LIST="${STATE_DIR}/created.list"
-SYSCTL_FILE="/etc/sysctl.d/99-xray-lowmem.conf"
+SYSCTL_DIR="/etc/sysctl.d"
+SYSCTL_FILE="${SYSCTL_DIR}/99-xray-lowmem.conf"
 DROPIN_DIR="/etc/systemd/system"
 PROTECT_UNIT="${DROPIN_DIR}/protect-init-oom.service"
 
@@ -59,6 +62,38 @@ have_systemd() {
 record_created() {
     mkdir -p "$STATE_DIR"
     grep -qxF "$1" "$CREATED_LIST" 2>/dev/null || echo "$1" >> "$CREATED_LIST"
+}
+
+# 字节数转人类可读, 未知名返回 "-"
+h_mb() {
+    case "${1:-}" in ''|max|n/a) echo "-"; return ;; esac
+    awk -v v="$1" 'BEGIN{ if (v >= 1073741824) printf "%.2f GB", v/1073741824; else printf "%.1f MB", v/1048576 }'
+}
+
+# 读 cgroup 文件; 不存在或内容为 max 时返回空串
+cg_read() {
+    [ -r "$1" ] || return 0
+    local v; v=$(cat "$1" 2>/dev/null)
+    [ "$v" = "max" ] || printf '%s' "$v"
+}
+
+# 按 RSS 列进程, 不依赖 ps 的 aux/sort 扩展 (busybox 上没有)
+# PROC_ROOT 仅供自测注入, 生产环境恒为 /proc
+proc_top_by_rss() {
+    local root="${PROC_ROOT:-/proc}"
+    local d rss name pid _a _b _c
+    for d in "$root"/[0-9]*; do
+        [ -r "$d/statm" ] || continue
+        read -r _a rss _b _c < "$d/statm" 2>/dev/null || continue
+        [ -n "${rss:-}" ] || continue
+        rss=$(( rss * 4 ))
+        [ "$rss" -ge 2048 ] || continue
+        pid=${d#"$root"/}
+        name=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-40)
+        [ -n "$name" ] || name=$(cat "$d/comm" 2>/dev/null)
+        [ -n "$name" ] || name="(kernel)"
+        printf "%9d KB  %-40s %s\n" "$rss" "$name" "$pid"
+    done | sort -rn | head -10
 }
 
 # ============================================================================
@@ -120,116 +155,212 @@ profile_values() {
 # ============================================================================
 do_status() {
     echo
-    c_blu "════════════════ 内存总览 ════════════════"
-    free -m
-    echo
-    c_blu "本地看到的磁盘 swap: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"
-    [ -z "$(swapon --show=NAME --noheadings 2>/dev/null)" ] && \
-        c_red "  → 容器内无 swap。注意 sock 内存本来也换不出去, 见下方说明。"
+    c_blu "════════════════ 一、内存总览 (以 cgroup 为准) ════════════════"
 
-    echo
-    c_blu "════════════════ cgroup 内存账本 ════════════════"
-    local mb
-    mb() { awk '{printf "%.1f MB", $1/1048576}'; }
+    local cg="" ver="" mx="" cur="" hi="" swmx="" swcur="" peak=""
     if [ -f /sys/fs/cgroup/memory.max ]; then
-        echo "cgroup v2   memory.max      : $(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
-        echo "cgroup v2   memory.high     : $(cat /sys/fs/cgroup/memory.high 2>/dev/null)"
-        echo "cgroup v2   memory.current  : $(cat /sys/fs/cgroup/memory.current 2>/dev/null | mb)"
-        echo "cgroup v2   memory.swap.max : $(cat /sys/fs/cgroup/memory.swap.max 2>/dev/null)"
-        echo "cgroup v2   memory.swap.cur : $(cat /sys/fs/cgroup/memory.swap.current 2>/dev/null | mb)"
-        echo
-        c_blu "--- memory.stat 关键项 (对照你截图里那张表) ---"
-        grep -E '^(anon|file|sock|kernel|slab|sock_tcp|sock_tcp6|sock_udp|sock_udp6|sock_tcp_from_anon) ' \
-             /sys/fs/cgroup/memory.stat 2>/dev/null \
-          | awk '{printf "  %-12s %9.1f MB\n", $1, $2/1048576}'
-        c_yel "  ↑ sock = socket 缓冲, 内核内存, 不可回收不可换出。这一项失控就是 OOM 的直接原因。"
+        cg=/sys/fs/cgroup; ver=v2
+        mx=$(cg_read "$cg/memory.max");   hi=$(cg_read "$cg/memory.high")
+        cur=$(cg_read "$cg/memory.current"); peak=$(cg_read "$cg/memory.peak")
+        swmx=$(cg_read "$cg/memory.swap.max"); swcur=$(cg_read "$cg/memory.swap.current")
     elif [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-        echo "cgroup v1   limit_in_bytes  : $(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
-        c_blu "--- memory.stat 关键项 ---"
-        grep -E '^(total_rss|total_cache|total_sock|total_slab|total_sock_tcp) ' \
-             /sys/fs/cgroup/memory/memory.stat 2>/dev/null \
-          | awk '{printf "  %-14s %9.1f MB\n", $1, $2/1048576}'
+        cg=/sys/fs/cgroup/memory; ver=v1
+        mx=$(cg_read "$cg/memory.limit_in_bytes")
+        cur=$(cg_read "$cg/memory.usage_in_bytes")
+        peak=$(cg_read "$cg/memory.max_usage_in_bytes")
+    fi
+
+    if [ -n "$mx" ]; then
+        local pct=0 mbmax
+        mbmax=$(( mx / 1048576 ))
+        [ "$mx" -gt 0 ] && [ -n "$cur" ] && pct=$(( cur * 100 / mx ))
+        printf "  容器内存上限 : %s\n" "$(h_mb "$mx")"
+        printf "  当前占用     : %-12s (%s%%)\n" "$(h_mb "$cur")" "$pct"
+        printf "  历史峰值     : %s\n" "$(h_mb "$peak")"
+        if [ "$ver" = v2 ]; then
+            if [ -n "$hi" ]; then printf "  软限 high    : %s\n" "$(h_mb "$hi")"
+            else printf "  软限 high    : %s\n" "max (未设软限, 只能等撞硬限)"; fi
+            printf "  swap 上限    : %s (已用 %s)\n" \
+                   "$( [ -n "$swmx" ] && h_mb "$swmx" || echo '0 → 已禁用' )" "$(h_mb "$swcur")"
+        fi
+        if [ "$pct" -ge 80 ]; then
+            c_red "  ⚠ 已用 ${pct}%, 再涨就撞上限。第二、三节是重点。"
+        elif [ "$pct" -ge 60 ]; then
+            c_yel "  用量偏高, 有空跑一次 apply。"
+        else
+            c_grn "  当前水位安全。"
+        fi
+
+        # free 在容器里读到的往往是宿主机数字, 别被它误导
+        local ftotal
+        ftotal=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+        if [ -n "$ftotal" ] && [ "$ftotal" -gt $(( mbmax * 2 )) ]; then
+            echo
+            c_yel "  ⚠ free 显示的 ${ftotal}MB 是【宿主机】内存, 不是你能用的。"
+            c_yel "    容器真实上限 ${mbmax}MB —— 下面所有判断都以 cgroup 为准。"
+        fi
     else
-        c_yel "没找到 cgroup memory 接口 (可能不在容器里)"
+        c_yel "  没读到 cgroup memory 限额 (不在容器里, 或 cgroup 未挂载)"
     fi
 
     echo
-    c_blu "════════════════ 网络栈缓冲现状 ════════════════"
-    c_yel "max 越大, 高速下载时数据在内存里堆得越多。当前值:"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_rmem"        "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_wmem"        "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_mem(页)"     "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.core.rmem_max"        "$(sysctl -n net.core.rmem_max 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.core.wmem_max"        "$(sysctl -n net.core.wmem_max 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_moderate_rcvbuf" "$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_adv_win_scale"   "$(sysctl -n net.ipv4.tcp_adv_win_scale 2>/dev/null)"
-    printf "  %-34s = %s\n" "net.ipv4.tcp_notsent_lowat"   "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
-    printf "  %-34s = %s\n" "vm.min_free_kbytes"       "$(sysctl -n vm.min_free_kbytes 2>/dev/null)"
-    printf "  %-34s = %s\n" "vm.panic_on_oom"          "$(sysctl -n vm.panic_on_oom 2>/dev/null)"
+    c_blu "════════════════ 二、cgroup 内存账本 (对照你截图那张表) ════════════════"
+    local statf=""
+    [ "$ver" = v2 ] && statf=/sys/fs/cgroup/memory.stat
+    [ "$ver" = v1 ] && statf=/sys/fs/cgroup/memory/memory.stat
+    if [ -r "$statf" ]; then
+        awk '{
+            v[$1]=$2
+        }
+        END{
+            split("anon file kernel slab sock sock_tcp sock_tcp6 sock_udp pagetables kernel_stack percpu shmem file_mapped", want, " ")
+            for (i=1; i<=12; i++) {
+                k=want[i]
+                if (v[k] != "") printf "  %-14s %8.1f MB\n", k, v[k]/1048576
+            }
+        }' "$statf"
+        local sockb
+        sockb=$(awk '$1=="sock"{print $2}' "$statf" 2>/dev/null)
+        if [ -n "$sockb" ] && [ "$sockb" -gt 0 ] 2>/dev/null; then
+            local spct=0
+            [ -n "$mx" ] && [ "$mx" -gt 0 ] && spct=$(( sockb * 100 / mx ))
+            if [ "$spct" -ge 25 ]; then
+                c_red "  ↑ sock 占了全容器 ${spct}% —— 这就是 OOM 的直接来源, 用 apply 压 tcp_rmem。"
+            else
+                c_yel "  ↑ sock = socket 缓冲, 内核内存, 不可回收、不可换出。"
+            fi
+        else
+            c_yel "  ↑ sock = socket 缓冲, 内核内存, 不可回收、不可换出。"
+        fi
+    fi
 
     echo
-    c_blu "════════════════ 实测 sock 占用 ════════════════"
+    c_blu "════════════════ 三、网络栈缓冲现状 ════════════════"
+    local rmax wmax
+    rmax=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
+    wmax=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $3}')
+    printf "  %-32s = %s\n" "net.ipv4.tcp_rmem" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.ipv4.tcp_wmem" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)"
+    if [ -n "$rmax" ] && [ "$rmax" -ge 8388608 ] 2>/dev/null; then
+        c_red "  ↑ 单流接收上限 $(h_mb "$rmax")。一条转发流两个 socket, 并发 5 条就能吃 ${mbmax:-256}MB 里的 160MB。"
+        c_red "    这正是你截图里 sock 150MB 的来源 —— 跑 apply 压到 2MB。"
+    fi
+    printf "  %-32s = %s\n" "net.ipv4.tcp_mem(页)" "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null)"
+    [ -z "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null)" ] && \
+        c_yel "  ↑ 读不到: 容器通常没把 tcp_mem 暴露出来 (它只影响全局, 影响不大)。"
+    printf "  %-32s = %s\n" "net.core.rmem_max" "$(sysctl -n net.core.rmem_max 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.core.wmem_max" "$(sysctl -n net.core.wmem_max 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.ipv4.tcp_moderate_rcvbuf" "$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.ipv4.tcp_adv_win_scale"   "$(sysctl -n net.ipv4.tcp_adv_win_scale 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.ipv4.tcp_limit_output_bytes" "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
+    printf "  %-32s = %s\n" "net.ipv4.tcp_notsent_lowat"   "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
+    printf "  %-32s = %s\n" "vm.min_free_kbytes"       "$(sysctl -n vm.min_free_kbytes 2>/dev/null)"
+    printf "  %-32s = %s\n" "vm.panic_on_oom"          "$(sysctl -n vm.panic_on_oom 2>/dev/null)"
+
+    echo
+    c_blu "════════════════ 四、实测 socket 占用 ════════════════"
     if command -v ss >/dev/null 2>&1; then
-        ss -tmn -a 2>/dev/null | grep -oE '(rb|tb)[0-9]+' \
-          | awk '{s += substr($0,3)} END{printf "  全机 TCP 收发缓冲合计: %.1f MB\n", s/1048576}'
+        ss -tanm 2>/dev/null | awk '
+            /^[ \t]*skmem:/ {
+                line=$0; gsub(/[(),]/," ",line); n=split(line,f," ")
+                rb=0; tb=0
+                for (i=1;i<=n;i++) {
+                    if (f[i] ~ /^rb[0-9]+$/) rb=substr(f[i],3)+0
+                    if (f[i] ~ /^tb[0-9]+$/) tb=substr(f[i],3)+0
+                }
+                s += rb+tb; c++
+            }
+            END { printf "  socket 数 %d, 收发缓冲合计 %.2f MB\n", c, s/1048576 }
+        '
         echo
         c_blu "--- 缓冲占用 Top8 的连接 ---"
-        ss -tmn -a 2>/dev/null \
-          | awk '/skmem:/{
-                n=split($0,a,"skmem:\\("); rest=a[n];
-                br=0; bw=0;
-                gsub(/[(),]/," ",rest); m=split(rest,f," ");
-                for(i=1;i<=m;i++){ if(f[i]~/^rb[0-9]/){br=substr(f[i],3)+0} if(f[i]~/^tb[0-9]/){bw=substr(f[i],3)+0} }
-                if(br+bw>65536) printf "%7.1f MB  %s\n", (br+bw)/1048576, $0
-            }' | sort -rn | head -8
-        echo
-        c_blu "--- 代理端口上的在建连接数 (每条连接至少 2 个 socket) ---"
-        for p in 8080 3001 3002 3003; do
-            local n
-            n=$(ss -tn state established "sport = :$p or dport = :$p" 2>/dev/null | tail -n +2 | wc -l)
-            [ "$n" -gt 0 ] && printf "  端口 %-5s : %s 条\n" "$p" "$n"
-        done
+        ss -tanm 2>/dev/null | awk '
+            /^[ \t]*skmem:/ {
+                if (cur == "") next
+                line=$0; gsub(/[(),]/," ",line); n=split(line,f," ")
+                rb=0; tb=0
+                for (i=1;i<=n;i++) {
+                    if (f[i] ~ /^rb[0-9]+$/) rb=substr(f[i],3)+0
+                    if (f[i] ~ /^tb[0-9]+$/) tb=substr(f[i],3)+0
+                }
+                printf "%8.2f MB  %s\n", (rb+tb)/1048576, cur
+                cur=""; next
+            }
+            /^(ESTAB|SYN-SENT|SYN-RECV|FIN-WAIT|TIME-WAIT|CLOSE-WAIT|LAST-ACK|CLOSING)/ { cur=$0; next }
+        ' | sort -rn | head -8
     else
         c_yel "  ss 未安装 (apt install -y iproute2)"
     fi
 
     echo
-    c_blu "════════════════ 进程占用 Top10 ════════════════"
-    ps aux --sort=-rss 2>/dev/null | head -11 \
-      | awk 'NR==1{print "  USER     RSS(MB)  进程"} NR>1{printf "  %-8s %7.1f  %s\n", $1, $6/1024, $11}'
+    c_blu "════════════════ 五、监听端口上的连接数 ════════════════"
+    if command -v ss >/dev/null 2>&1; then
+        local ports="" p n
+        ports=$(ss -tln 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*://' \
+                | grep -E '^[0-9]+$' | sort -un | grep -vxE '22' | head -12)
+        if [ -z "$ports" ]; then
+            c_yel "  没发现 TCP 监听端口 (服务是不是没起?)"
+        else
+            printf "  %-8s %-8s %s\n" "端口" "连接数" "备注"
+            for p in $ports; do
+                n=$(ss -tan 2>/dev/null | awk -v P=":$p" 'NR>1 && ($4 ~ (P "$") || $5 ~ (P "$"))' | wc -l)
+                printf "  %-8s %-8s %s\n" "$p" "$n" \
+                    "$( [ "$n" -ge 20 ] && echo '每条连接至少 2 个 socket, 偏多了' )"
+            done
+        fi
+    fi
 
     echo
-    c_blu "════════════════ OOM 防护是否到位 ════════════════"
+    c_blu "════════════════ 六、进程占用 Top10 (按 RSS) ════════════════"
+    printf "  %9s  %-40s %s\n" "RSS" "进程" "PID"
+    proc_top_by_rss | sed 's/^/  /'
+
+    echo
+    c_blu "════════════════ 七、OOM 防护是否到位 ════════════════"
     local adj1
     adj1=$(cat /proc/1/oom_score_adj 2>/dev/null)
     if [ -n "$adj1" ] && [ "$adj1" -lt 0 ] 2>/dev/null; then
-        c_grn "  PID1 oom_score_adj = $adj1  → 内核不会再优先杀 init"
+        c_grn "  PID1 oom_score_adj = ${adj1}  → 内核不会再优先杀 init ✔"
     else
-        c_red "  PID1 oom_score_adj = ${adj1:-?}  → init 是合法靶子, 一被杀整机就停"
+        c_red "  PID1 oom_score_adj = ${adj1:-?}  → init 仍是合法靶子, 一被杀整机就停"
         c_yel "  修: bash $0 protect"
     fi
-    local u cap
-    for u in xray tunnel caddy; do
-        systemctl cat "$u.service" >/dev/null 2>&1 || continue
-        cap=$(systemctl show -p MemoryMax --value "$u" 2>/dev/null)
-        if [ -n "$cap" ] && [ "$cap" != "infinity" ]; then
-            c_grn "  ${u}.service MemoryMax=$cap 已生效"
-        else
-            c_yel "  ${u}.service MemoryMax 未设置"
-        fi
-    done
+    if have_systemd; then
+        local u cap
+        for u in xray tunnel caddy; do
+            systemctl cat "${u}.service" >/dev/null 2>&1 || continue
+            cap=$(systemctl show -p MemoryMax --value "$u" 2>/dev/null)
+            if [ -n "$cap" ] && [ "$cap" != "infinity" ]; then
+                c_grn "  ${u}.service MemoryMax=$(h_mb "$cap") 已生效"
+            else
+                c_yel "  ${u}.service MemoryMax 未设置"
+            fi
+        done
+    else
+        c_yel "  没有运行中的 systemd → 服务限额这一层用不了, 只能靠 sysctl + protect。"
+    fi
 
     echo
-    c_blu "════════════════ 最近一次 OOM 取证 ════════════════"
+    c_blu "════════════════ 八、最近一次 OOM 取证 ════════════════"
+    local got=""
     if command -v journalctl >/dev/null 2>&1; then
-        journalctl -k --no-pager 2>/dev/null | grep -E 'invoked oom-killer|oom-kill:|Out of memory' | tail -12
+        got=$(journalctl -k --no-pager 2>/dev/null | grep -E 'invoked oom-killer|oom-kill:|Out of memory' | tail -8)
     fi
-    [ -r /var/log/kern.log ] && grep -E 'invoked oom-killer|Out of memory' /var/log/kern.log 2>/dev/null | tail -5
+    [ -z "$got" ] && [ -r /var/log/kern.log ] && \
+        got=$(grep -E 'invoked oom-killer|Out of memory' /var/log/kern.log 2>/dev/null | tail -8)
+    [ -z "$got" ] && [ -r /var/log/syslog ] && \
+        got=$(grep -E 'invoked oom-killer|Out of memory' /var/log/syslog 2>/dev/null | tail -8)
+    [ -z "$got" ] && command -v dmesg >/dev/null 2>&1 && \
+        got=$(dmesg 2>/dev/null | grep -E 'invoked oom-killer|Out of memory' | tail -8)
+    if [ -n "$got" ]; then
+        printf '%s\n' "$got"
+    else
+        c_yel "  取不到 (平台藏了内核日志 / dmesg 受限)。用服务商给的那张图就够了。"
+    fi
+
     echo
-    c_yel "  若上面为空: 平台把内核日志藏了, 或 dmesg 受限。用截图那份就够了。"
-    echo
-    c_blu "════════════════ 本脚本改动状态 ════════════════"
-    [ -f "$SYSCTL_FILE" ] && c_grn "  已写入 $SYSCTL_FILE" || c_yel "  未写入 sysctl 调优"
+    c_blu "════════════════ 九、本脚本改动状态 ════════════════"
+    [ -f "$SYSCTL_FILE" ] && c_grn "  已写入 $SYSCTL_FILE"  || c_yel "  未写入 sysctl 调优"
     [ -f "$PROTECT_UNIT" ] && c_grn "  已安装 init OOM 保护" || c_yel "  未安装 init OOM 保护"
     echo
 }
@@ -240,19 +371,37 @@ do_status() {
 do_apply() {
     need_root
     profile_values "${1:-2}" || { c_red "档位只能是 1 / 2 / 4"; return 1; }
-    mkdir -p "$STATE_DIR" /etc/sysctl.d
+    mkdir -p "$STATE_DIR" "$SYSCTL_DIR"
 
     echo
     c_blu "════════ 档位: ${P_NAME} ════════"
     c_yel "  ${P_BDP}"
     echo
-    c_yel "  原理: 内核默认 tcp_rmem max=6MB / tcp_wmem max=4MB, 意味着单条连接"
-    c_yel "        最多可以把 10MB 数据压在内存里。xray 转发一条流要占 2 个 socket"
-    c_yel "        (上游 recv + 下游 send), 所以一条 20MB/s 的流最多能占 20MB。"
-    c_yel "        并发 8 条就是 160MB —— 正好对得上你截图里的 sock 150MB。"
+    # 先量当前值, 后面的解释才有意义 —— 每台机器的镜像默认值都不一样
+    local cur_rmax cur_wmax cur_tsq cur_lowat
+    cur_rmax=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
+    cur_wmax=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null | awk '{print $3}')
+    cur_tsq=$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)
+    cur_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)
+
+    c_blu "  这台机器的现状 → 改完:"
+    printf "    %-28s %-12s → %s\n" "tcp_rmem  max"  "$(h_mb "${cur_rmax:-?}")" "$(h_mb "$P_RMEM_MAX")"
+    printf "    %-28s %-12s → %s\n" "tcp_wmem  max"  "$(h_mb "${cur_wmax:-?}")" "$(h_mb "$P_WMEM_MAX")"
+    printf "    %-28s %-12s → %s\n" "tcp_limit_output_bytes" "${cur_tsq:-?}" "${P_TSQ}"
+    printf "    %-28s %-12s → %s\n" "tcp_notsent_lowat" "${cur_lowat:-?}" "16384"
+    echo
+
+    c_yel "  原理: xray 转发一条流占 2 个 socket (上游 recv + 下游 send),"
+    if [ -n "$cur_rmax" ] && [ "$cur_rmax" -gt 4194304 ] 2>/dev/null; then
+        c_red  "        你这台现在单流接收上限是 $(h_mb "$cur_rmax") —— 远超内核默认的 6MB,"
+        c_red  "        是镜像里有人给高 BDP 链路调过的。一条流两个 socket 能吃到 $(( (cur_rmax + cur_wmax) / 1048576 ))MB,"
+        c_red  "        并发 5 条就顶穿 256MB —— 这就是 sock 150MB 的来源。"
+    else
+        c_yel "        默认 6MB/4MB 上限下, 一条流最多压 10MB; 并发 8 条 = 80MB。"
+    fi
     c_yel ""
-    c_yel "        把 max 压小后, 内核会提前缩窗口, 数据留在对端而不是我们这边。"
-    c_yel "        代价是单流峰值下降 (见上面的 BDP 换算), 多线程下载可线性补回。"
+    c_yel "        压小 max 后内核会提前缩窗口, 数据留在对端而不是我们这边。"
+    c_yel "        代价是单流峰值下降 (见上面 BDP 换算), 多线程下载可线性补回。"
     [ -n "${P_WARN:-}" ] && c_red "  ⚠ ${P_WARN}"
     echo
 
@@ -321,28 +470,81 @@ vm.dirty_background_ratio = 5
 EOF
 
     [ -f "$SYSCTL_FILE" ] && record_created "$SYSCTL_FILE"
-    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
-        c_grn "  ✔ sysctl 已写入并生效"
-    else
-        c_red "  ✘ 部分参数没写进去 (很多托管容器会把 net.* 设成只读)"
-        c_yel "    逐条重试看是哪一项?"
-        while IFS= read -r line; do
-            case "$line" in ''|'#'*) continue ;; esac
-            local k v
-            k=${line%%=*}; k=$(echo "$k" | tr -d ' ')
-            v=${line#*=}; v=$(echo "$v" | tr -s ' ')
-            sysctl -w "${k}=${v}" >/dev/null 2>&1 || c_yel "      ✘ 无法设置 ${k}"
-        done < "$SYSCTL_FILE"
-        c_yel "    能设的都设了, 设不了的通常是容器 sysctl 白名单限制, 只能换机器/找服务商放开。"
+
+    # 逐条应用而不是 sysctl -p 一把梭: 容器常有 sysctl 白名单,
+    # 一条失败不该连累后面的条目。失败项收集起来最后统一报告。
+    # 关键区分: net.* 是「按网络命名空间隔离」的, 容器内可写;
+    #           vm.* 是「全局」的, 容器内基本一定只读 (读到的是宿主机值)。
+    # 所以 vm.* 失败属于预期, 不能算进方案失败。
+    local okn=0 k v line
+    local ok_net=0 ok_vm=0 bad_net="" bad_vm="" kskip=""
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in *=*) ;; *) continue ;; esac
+        k=${line%%=*}; k=$(printf '%s' "$k" | tr -d ' \t')
+        v=${line#*=}; v=$(printf '%s' "$v" | tr -s ' \t' ' ' | sed 's/^ //; s/ $//')
+        [ -n "$k" ] && [ -n "$v" ] || continue
+        # 值必须是非空数字/空格序列, 否则跳过 (防止残留占位符被写进去)
+        case "$v" in *[!0-9[:space:]]*) kskip="$kskip
+      $k (值异常: '$v')"; continue ;; esac
+        if sysctl -w "${k}=${v}" >/dev/null 2>&1; then
+            okn=$((okn + 1))
+            case "$k" in net.*) ok_net=$((ok_net + 1)) ;; vm.*) ok_vm=$((ok_vm + 1)) ;; esac
+        else
+            case "$k" in
+                net.*) bad_net="$bad_net
+      $k" ;;
+                *)     bad_vm="$bad_vm
+      $k" ;;
+            esac
+        fi
+    done < "$SYSCTL_FILE"
+
+    echo
+    c_blu "--- 应用结果 ---"
+    c_grn "  ✔ 网络栈参数 (net.*): 成功 ${ok_net} 项  <- 决定 sock 能不能压住"
+    if [ -n "$bad_net" ]; then
+        c_red "  ✘ 网络栈参数被拒绝:${bad_net}"
+        c_yel "    这些是 network namespace 内的参数, 正常容器都能写。"
+        c_yel "    被拒说明平台加了 sysctl 白名单, 需要工单放开, 否则方案会失效。"
+    fi
+    if [ "$ok_vm" -gt 0 ] || [ -n "$bad_vm" ]; then
+        if [ -n "$bad_vm" ]; then
+            c_yel "  ⚠ 内核/VM 参数 (vm.*): 写了 ${ok_vm} 项, 被拒若干 -- 属预期。"
+            c_yel "    vm.* 是全局参数、不分容器, 容器内基本一定只读。"
+            c_yel "    这块在裸机上才有意义; 你看到的 min_free_kbytes 是宿主机的, 别管它。"
+        else
+            c_grn "  ✔ 内核/VM 参数 (vm.*): 成功 ${ok_vm} 项 (难得, 说明没被限制)"
+        fi
+    fi
+    if [ -n "$kskip" ]; then
+        c_yel "  ⚠ 跳过 (值异常) :${kskip}"
     fi
 
     echo
-    c_blu "--- 验证 ---"
-    printf "  tcp_rmem = %s\n" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)"
-    printf "  tcp_wmem = %s\n" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)"
-    printf "  tcp_mem  = %s\n" "$(sysctl -n net.ipv4.tcp_mem 2>/dev/null)"
+    c_blu "--- 核心项验证 ---"
+    local v_r v_w v_s v_l fail_core=0
+    v_r=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)
+    v_w=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)
+    v_s=$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)
+    v_l=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)
+    printf "  %-28s = %s\n" "tcp_rmem"             "${v_r:-读不到}"
+    printf "  %-28s = %s\n" "tcp_wmem"             "${v_w:-读不到}"
+    printf "  %-28s = %s\n" "tcp_limit_output_bytes" "${v_s:-读不到}"
+    printf "  %-28s = %s\n" "tcp_notsent_lowat"    "${v_l:-读不到}"
+    [ "$(printf '%s' "$v_r" | awk '{print $3}')" = "$P_RMEM_MAX" ] || fail_core=1
+    [ "$(printf '%s' "$v_w" | awk '{print $3}')" = "$P_WMEM_MAX" ] || fail_core=1
+
     echo
-    c_grn "sysctl 立即生效, 不需要重启服务。"
+    if [ "$fail_core" -eq 1 ]; then
+        c_red "  ✘ 核心项没生效 —— 这台机器把 net.ipv4.tcp_rmem 设成了只读。"
+        c_yel "    在这种托管容器里, 内核缓冲参数改不了, 本脚本的第三道防线失效。"
+        c_yel "    那就只剩 protect + limits + 客户端限线程 + 关 argo 这几条了。"
+        echo
+        return 1
+    fi
+    c_grn "  ✔ 核心项已生效。不需要重启服务, 新连接立即使用新上限。"
+    c_yel "    已有连接沿用旧缓冲大小, 断开重连后才切换 —— 这也是要重启服务的原因之一。"
     echo
 }
 
@@ -420,6 +622,102 @@ EOF
     echo
     c_yel "  注意: 这不能减少内存占用, 只是改变\"谁去死\"。"
     c_yel "  真正的减负还得靠 apply 里的缓冲上限 + advice 里的关入站。"
+    echo
+}
+
+# ============================================================================
+#  3.5 cgroup memory.high —— sysctl 被锁死时的第二条路
+#
+#  memory.max 是硬限, 撞上直接 OOM 杀进程。
+#  memory.high 是软限, 越过它内核会「先回收再说」: 压 page cache、
+#  回收可回收页、并把该 cgroup 里的进程按配额限速 (return-to-user 节流),
+#  而不是立刻开枪。对小内存机器这就是「撞墙前的刹车」。
+#
+#  为什么这条特别值得开: net.ipv4.* 被平台锁读时 (b4 里那种托管容器),
+#  sysctl 那条主防线直接失效, 而 cgroup 自己的文件通常还能写。
+# ============================================================================
+do_cgroup() {
+    need_root
+    local root="${CGROUP_ROOT:-/sys/fs/cgroup}"
+    echo
+    c_blu "════════ 设置 cgroup 软限 memory.high ════════"
+
+    if [ ! -f "$root/memory.max" ]; then
+        c_red "  没有 cgroup v2 接口 ($root/memory.max 不存在)。"
+        c_yel "  宿主机是 cgroup v1 或被完全屏蔽, 这一层用不了。"
+        echo
+        return 1
+    fi
+
+    local mx cur hi
+    mx=$(cat "$root/memory.max" 2>/dev/null)
+    cur=$(cat "$root/memory.current" 2>/dev/null)
+    hi=$(cat "$root/memory.high" 2>/dev/null)
+    c_blu "  现状:"
+    printf "    %-14s %s\n" "memory.max"     "$( [ "$mx" = max ] && echo 'max (没有硬限!)' || h_mb "$mx" )"
+    printf "    %-14s %s\n" "memory.current" "$(h_mb "$cur")"
+    printf "    %-14s %s\n" "memory.high"    "$( [ "$hi" = max ] && echo 'max (等于没设软限)' || h_mb "$hi" )"
+    echo
+
+    if [ "$mx" = "max" ]; then
+        c_yel "  memory.max 是 max, 说明这个 cgroup 本身没有硬限 ——"
+        c_yel "  你看到的 256MB 限制来自上一层, 这里设 high 意义不大, 跳过。"
+        echo
+        return 1
+    fi
+
+    # 留 12% 余量: 到线就开始刹车, 不要等撞上硬限
+    local target
+    target=$(( mx / 100 * 88 ))
+    c_yel "  目标 memory.high = ${mx} 的 88% = $(h_mb "$target")"
+    c_yel "  含义: 涨到这一线开始回收/节流, 而不是直接 OOM 停机。"
+    c_yel "        硬限仍是 $(h_mb "$mx"), 只是提前有缓冲带。"
+    echo
+
+    if ! printf '%s' "$target" > "$root/memory.high" 2>/dev/null; then
+        c_red "  ✘ 写不进去。cgroup 内存控制器没委托给容器, 这层用不了。"
+        c_yel "    检查: ls -l $root/memory.high   (看属主能不能写)"
+        echo
+        return 1
+    fi
+    c_grn "  ✔ memory.high 已设为 $(h_mb "$(cat "$root/memory.high" 2>/dev/null)")"
+
+    # 容器重启后 high 会回到 max, 用 oneshot 单元在早期重新写一次
+    mkdir -p "$STATE_DIR"
+    if have_systemd && [ -n "$DROPIN_DIR" ]; then
+        local unit="${DROPIN_DIR}/xray-mem-high.service"
+        cat > "$unit" <<EOF
+# 由 xray-mem-fix.sh 生成 — 容器重启后把 cgroup 软限重新设上
+# 删除: rm ${unit} && systemctl daemon-reload
+[Unit]
+Description=Set cgroup memory.high (xray-mem-fix)
+DefaultDependencies=no
+After=sysinit.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'printf ${target} > ${root}/memory.high 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        record_created "$unit"
+        if systemctl daemon-reload 2>/dev/null && \
+           systemctl enable --now xray-mem-high.service >/dev/null 2>&1; then
+            c_grn "  ✔ 已装开机自启单元 xray-mem-high.service"
+        else
+            c_yel "  ⚠ 自启单元没启用成功, 当前已生效, 重启容器后需重跑一次 cgroup"
+        fi
+    else
+        c_yel "  没有运行中的 systemd, 重启容器后需重跑一次 cgroup"
+    fi
+
+    echo
+    c_yel "  注意: memory.high 对 sock (内核内存) 不能直接回收,"
+    c_yel "        它的价值是提前节流进程、压掉 page cache, 给 sock 腾地方。"
+    c_yel "        配合 apply 的缓冲上限才完整 —— 单靠它治不了根。"
     echo
 }
 
@@ -620,6 +918,55 @@ do_advice() {
 }
 
 # ============================================================================
+#  6.5 前台采样: 抓 OOM 那一刻到底是谁在涨 (只读)
+# ============================================================================
+do_watch() {
+    local interval="${1:-5}"
+    case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
+    [ "$interval" -lt 1 ] && interval=1
+
+    local statf=/sys/fs/cgroup/memory.stat
+    [ -r "$statf" ] || statf=/sys/fs/cgroup/memory/memory.stat
+    local curf=/sys/fs/cgroup/memory.current
+    [ -r "$curf" ] || curf=/sys/fs/cgroup/memory/memory.usage_in_bytes
+    if [ ! -r "$curf" ]; then
+        c_red "读不到 cgroup 内存文件, 换台机器或去掉容器层再试。"
+        return 1
+    fi
+
+    mkdir -p "$STATE_DIR"
+    local log="${STATE_DIR}/peak.log"
+    local maxb peak_sock peak_conn peak_t
+    maxb=0; peak_sock=0; peak_conn=0; peak_t=""
+
+    echo
+    c_blu "════════ 采样中 (每 ${interval}s, Ctrl-C 结束) ════════"
+    c_yel "  对应你截图那张表: sock 是内核缓冲, anon 是进程实际占用。"
+    c_yel "  sock 涨到 100MB 以上就是正在往 OOM 走的信号。"
+    printf "  %-19s %10s %10s %8s
+" "时间" "总计" "sock" "连接数"
+    echo "  ────────────────────────────────────────────────"
+
+    trap 'echo; printf "  峰值: 总 %s / sock %s / 连接 %s (发生在 %s)\n" \
+        "$(h_mb "$maxb")" "$(h_mb "$peak_sock")" "$peak_conn" "${peak_t:-n/a}"
+        printf "  采样日志: %s\n" "$log"; return 0' INT
+
+    local cur sock conn n
+    while :; do
+        cur=$(cat "$curf" 2>/dev/null); cur=${cur:-0}
+        sock=$(awk '$1=="sock"{print $2}' "$statf" 2>/dev/null); sock=${sock:-0}
+        conn=$(ss -tan 2>/dev/null | awk 'NR>1 && $1=="ESTAB"' | wc -l)
+        n=$(date '+%H:%M:%S')
+        printf "  %-19s %10s %10s %8s\n" "$n" "$(h_mb "$cur")" "$(h_mb "$sock")" "$conn"
+        if [ "$cur" -gt "$maxb" ] 2>/dev/null; then maxb=$cur; peak_t=$n; fi
+        if [ "$sock" -gt "$peak_sock" ] 2>/dev/null; then peak_sock=$sock; fi
+        if [ "$conn" -gt "$peak_conn" ] 2>/dev/null; then peak_conn=$conn; fi
+        printf '%s cur=%s sock=%s conn=%s\n' "$n" "$cur" "$sock" "$conn" >> "$log"
+        sleep "$interval"
+    done
+}
+
+# ============================================================================
 #  7. 还原
 # ============================================================================
 do_revert() {
@@ -657,8 +1004,10 @@ do_revert() {
 # ============================================================================
 do_all() {
     need_root
-    do_apply "${1:-2}"
+    do_apply "${1:-2}" || c_yel "
+  (apply 报了问题, 继续跑后面两道防线)"
     do_protect
+    do_cgroup
     do_limits
     echo
     c_blu "════════ 全套完成 ════════"
@@ -688,11 +1037,13 @@ menu() {
         c_grn "  5. 只调 sysctl 缓冲 (roomy 4MB)"
         c_grn "  6. 只保护 PID 1 不被 OOM 选中"
         c_grn "  7. 只给服务加 cgroup 内存上限"
+        c_grn "  7b.只设 cgroup 软限 memory.high (sysctl 被锁时用)"
         echo "  ─────────────────────────────"
         c_grn "  8. 添加 512MB swap"
         c_grn "  9. 看配置减肥建议 (关 argo / 关 sniffing)"
         echo "  ─────────────────────────────"
-        c_red " 10. 还原全部改动"
+        c_grn " 10. 前台采样 (抓 OOM 前的 sock 曲线)"
+        c_red " 11. 还原全部改动"
         c_yel "  0. 退出"
         echo
         printf '\033[1;91m请输入选择: \033[0m'
@@ -705,9 +1056,11 @@ menu() {
             5)  do_apply 4; pause ;;
             6)  do_protect; pause ;;
             7)  do_limits;  pause ;;
+            7b) do_cgroup;  pause ;;
             8)  do_swap;    pause ;;
             9)  do_advice;  pause ;;
-            10) do_revert;  pause ;;
+            10) do_watch;   pause ;;
+            11) do_revert;  pause ;;
             0)  exit 0 ;;
             *)  c_red "无效选项"; sleep 1 ;;
         esac
@@ -722,15 +1075,17 @@ main() {
         apply)     do_apply "${2:-2}" ;;
         protect)   do_protect ;;
         limits)    do_limits ;;
+        cgroup)    do_cgroup ;;
         swap)      do_swap ;;
         advice)    do_advice ;;
+        watch)     do_watch "${2:-5}" ;;
         revert)    do_revert ;;
         all)       do_all "${2:-2}" ;;
         "")        menu ;;
         -h|--help|help)
-            sed -n '2,30p' "$0" ;;
+            sed -n '2,24p' "$0" ;;
         *)  c_red "未知操作: ${action}"
-            echo "用法: bash $0 [status|apply [1|2|4]|protect|limits|swap|advice|revert|all]"
+            echo "用法: bash $0 [status|apply [1|2|4]|protect|limits|cgroup|swap|advice|watch [秒]|revert|all]"
             exit 1 ;;
     esac
 }
